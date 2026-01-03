@@ -7,9 +7,10 @@ Reverse proxy HTTP qui route les requêtes :
 
 import os
 import sys
-import socket
-import threading
-from urllib.parse import urlparse
+import http.server
+import socketserver
+import urllib.request
+import urllib.parse
 
 # Configuration
 GOTENBERG_HOST = 'localhost'
@@ -18,85 +19,93 @@ POST_PROCESS_HOST = 'localhost'
 POST_PROCESS_PORT = 3001
 PROXY_PORT = int(os.environ.get('PORT', 3000))
 
-# Si le port est le même que Gotenberg, on change le port interne de Gotenberg
-if PROXY_PORT == GOTENBERG_PORT:
-    # Le reverse proxy écoute sur le port principal, Gotenberg doit écouter ailleurs
-    # Mais en fait, on garde Gotenberg sur 3000 et le proxy écoute sur PORT
-    pass
-
-def forward_request(data, target_host, target_port):
-    """Forward une requête HTTP vers un service cible"""
-    try:
-        target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        target_sock.connect((target_host, target_port))
-        target_sock.sendall(data)
-        
-        response = b''
-        while True:
-            chunk = target_sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        
-        target_sock.close()
-        return response
-    except Exception as e:
-        print(f"Error forwarding request: {e}", file=sys.stderr)
-        return None
-
-def handle_connection(client_sock, addr):
-    """Gère une connexion client"""
-    try:
-        # Lire la requête
-        data = client_sock.recv(8192)
-        if not data:
-            return
-        
-        request_str = data.decode('utf-8', errors='ignore')
-        first_line = request_str.split('\n')[0] if '\n' in request_str else request_str
-        
-        # Décider où router
-        if '/fix-pdfa3' in first_line:
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        # Gérer HEAD pour les health checks
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_GET(self):
+        self.proxy_request('GET')
+    
+    def do_POST(self):
+        self.proxy_request('POST')
+    
+    def do_PUT(self):
+        self.proxy_request('PUT')
+    
+    def do_DELETE(self):
+        self.proxy_request('DELETE')
+    
+    def proxy_request(self, method):
+        # Décider où router la requête
+        if '/fix-pdfa3' in self.path:
             target_host = POST_PROCESS_HOST
             target_port = POST_PROCESS_PORT
         else:
             target_host = GOTENBERG_HOST
             target_port = GOTENBERG_PORT
         
-        # Forwarder la requête
-        response = forward_request(data, target_host, target_port)
+        # Lire le corps de la requête
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b''
         
-        if response:
-            client_sock.sendall(response)
-        else:
-            # Erreur 502 Bad Gateway
-            error_response = b'HTTP/1.1 502 Bad Gateway\r\n\r\n'
-            client_sock.sendall(error_response)
-    except Exception as e:
-        print(f"Error in handle_connection: {e}", file=sys.stderr)
-    finally:
-        client_sock.close()
+        # Construire l'URL cible
+        target_url = f'http://{target_host}:{target_port}{self.path}'
+        if self.query_string:
+            target_url += '?' + self.query_string
+        
+        try:
+            # Créer la requête
+            req = urllib.request.Request(target_url, data=body, method=method)
+            
+            # Copier les headers (sauf Host)
+            for header, value in self.headers.items():
+                if header.lower() != 'host' and header.lower() != 'connection':
+                    req.add_header(header, value)
+            
+            # Envoyer la requête
+            with urllib.request.urlopen(req, timeout=60) as response:
+                # Copier les headers de la réponse
+                self.send_response(response.getcode())
+                for header, value in response.headers.items():
+                    if header.lower() not in ['connection', 'transfer-encoding']:
+                        self.send_header(header, value)
+                self.end_headers()
+                
+                # Copier le corps de la réponse
+                self.wfile.write(response.read())
+                
+        except urllib.error.HTTPError as e:
+            self.send_response(e.code)
+            self.end_headers()
+            self.wfile.write(e.read())
+        except Exception as e:
+            print(f"Error proxying request: {e}", file=sys.stderr, flush=True)
+            self.send_error(502, f"Proxy error: {str(e)}")
+    
+    def log_message(self, format, *args):
+        # Log simplifié
+        if '/fix-pdfa3' in self.path or self.path == '/':
+            print(f"{self.address_string()} - {format % args}", flush=True)
 
 def main():
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(('0.0.0.0', PROXY_PORT))
-    server_sock.listen(100)
+    handler = ProxyHandler
+    httpd = socketserver.TCPServer(("0.0.0.0", PROXY_PORT), handler)
     
-    print(f'Reverse proxy listening on port {PROXY_PORT}')
-    print(f'Routing /fix-pdfa3 -> {POST_PROCESS_HOST}:{POST_PROCESS_PORT}')
+    print(f'Reverse proxy listening on port {PROXY_PORT}', flush=True)
+    print(f'Routing /fix-pdfa3 -> {POST_PROCESS_HOST}:{POST_PROCESS_PORT}', flush=True)
     print(f'Routing everything else -> {GOTENBERG_HOST}:{GOTENBERG_PORT}', flush=True)
     
-    while True:
-        try:
-            client_sock, addr = server_sock.accept()
-            thread = threading.Thread(target=handle_connection, args=(client_sock, addr))
-            thread.daemon = True
-            thread.start()
-        except KeyboardInterrupt:
-            break
-    
-    server_sock.close()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...", flush=True)
+        httpd.shutdown()
 
 if __name__ == '__main__':
     main()
