@@ -7,7 +7,7 @@ FROM gotenberg/gotenberg:8
 USER root
 
 RUN apt-get update && \
-    apt-get install -y ghostscript python3 && \
+    apt-get install -y ghostscript python3 netcat-openbsd && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -26,18 +26,32 @@ RUN chmod +x /usr/local/bin/fix-pdfa3-server.py && \
 
 # Créer le script de démarrage qui lance tous les services
 RUN echo '#!/bin/bash\n\
-# Démarrer Gotenberg en arrière-plan (port 3000)\n\
-/usr/bin/gotenberg &\n\
+set -e\n\
 \n\
-# Démarrer le serveur de post-traitement en arrière-plan (port 3001)\n\
+# Démarrer Gotenberg en arrière-plan (port 3000 interne)\n\
+/usr/bin/gotenberg &\n\
+GOTENBERG_PID=$!\n\
+\n\
+# Démarrer le serveur de post-traitement en arrière-plan (port 3001 interne)\n\
 /usr/local/bin/fix-pdfa3-server.py &\n\
+POST_PROCESS_PID=$!\n\
 \n\
 # Attendre que les services démarrent\n\
-sleep 3\n\
+echo "Waiting for services to start..."\n\
+for i in {1..10}; do\n\
+    if nc -z localhost 3000 && nc -z localhost 3001; then\n\
+        echo "All services started"\n\
+        break\n\
+    fi\n\
+    sleep 1\n\
+done\n\
 \n\
 # Démarrer le reverse proxy sur le port principal (PORT ou 3000)\n\
+# Le reverse proxy écoute sur le port exposé par Render et route vers les services internes\n\
+echo "Starting reverse proxy on port ${PORT:-3000}"\n\
 exec /usr/local/bin/reverse-proxy.py' > /usr/local/bin/start.sh && \
-    chmod +x /usr/local/bin/start.sh
+    chmod +x /usr/local/bin/start.sh && \
+    apt-get update && apt-get install -y netcat-openbsd && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Revenir à l'utilisateur gotenberg (sécurité)
 USER gotenberg

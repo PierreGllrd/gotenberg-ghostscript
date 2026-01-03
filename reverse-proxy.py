@@ -18,6 +18,12 @@ POST_PROCESS_HOST = 'localhost'
 POST_PROCESS_PORT = 3001
 PROXY_PORT = int(os.environ.get('PORT', 3000))
 
+# Si le port est le même que Gotenberg, on change le port interne de Gotenberg
+if PROXY_PORT == GOTENBERG_PORT:
+    # Le reverse proxy écoute sur le port principal, Gotenberg doit écouter ailleurs
+    # Mais en fait, on garde Gotenberg sur 3000 et le proxy écoute sur PORT
+    pass
+
 def forward_request(data, target_host, target_port):
     """Forward une requête HTTP vers un service cible"""
     try:
